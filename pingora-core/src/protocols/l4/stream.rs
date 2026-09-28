@@ -140,7 +140,8 @@ impl AsRawFd for RawStream {
         match self {
             RawStream::Tcp(s) => s.as_raw_fd(),
             RawStream::Unix(s) => s.as_raw_fd(),
-            RawStream::Virtual(_) => -1, // Virtual stream does not have a real fd
+            // A virtual stream only has a real fd when its socket exposes one.
+            RawStream::Virtual(s) => s.socket.as_raw_fd().unwrap_or(-1),
         }
     }
 }
@@ -150,8 +151,9 @@ impl AsRawSocket for RawStream {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
         match self {
             RawStream::Tcp(s) => s.as_raw_socket(),
-            // Virtual stream does not have a real socket, return INVALID_SOCKET (!0)
-            RawStream::Virtual(_) => !0,
+            // A virtual stream only has a real socket when its socket exposes
+            // one; otherwise return INVALID_SOCKET (!0).
+            RawStream::Virtual(s) => s.socket.as_raw_socket().unwrap_or(!0),
         }
     }
 }
