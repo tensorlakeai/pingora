@@ -133,7 +133,16 @@ impl ConnectionRef {
         // Atomically check if the current_stream is over the limit
         // load(), compare and then fetch_add() cannot guarantee the same
         let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
-        if current_streams >= self.0.max_streams {
+        // Also honor the server's current SETTINGS_MAX_CONCURRENT_STREAMS. `max_streams` is
+        // captured at handshake, usually before the server's SETTINGS arrive. A stream over the
+        // server's limit is not refused by h2: it waits in h2's pending-open queue, with no
+        // timeout, until another stream on this connection closes. Returning None makes the
+        // caller open a new connection instead, which the connect timeouts bound.
+        let max_streams = self
+            .0
+            .max_streams
+            .min(self.0.connection_stub.0.current_max_send_streams());
+        if current_streams >= max_streams {
             // already over the limit, reset the counter to the previous value
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
@@ -284,10 +293,10 @@ impl Connector {
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
         let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
-        let h2_stream = conn
-            .spawn_stream()
-            .await?
-            .expect("newly created connections should have at least one free stream");
+        // The server may have advertised zero streams since the handshake checked.
+        let Some(h2_stream) = conn.spawn_stream().await? else {
+            return Error::e_explain(H2Error, "new h2 connection has no free stream");
+        };
         if conn.more_streams_allowed() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }
@@ -628,6 +637,56 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_stream_honors_server_max_concurrent_streams() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            let mut server = h2::server::Builder::new()
+                .max_concurrent_streams(1)
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .unwrap();
+            // Accepting drives the connection; the requests are never answered.
+            let mut requests = Vec::new();
+            while let Some(Ok(request)) = server.accept().await {
+                requests.push(request);
+            }
+        });
+        // Allow more local streams than the server will, as `handshake()` does before the
+        // server's SETTINGS arrive.
+        let (send_req, connection) = h2::client::Builder::new()
+            .initial_max_send_streams(4)
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while send_req.current_max_send_streams() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server SETTINGS were not applied"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 4, Digest::default());
+
+        let first = conn
+            .spawn_stream()
+            .await
+            .unwrap()
+            .expect("first stream fits");
+        assert!(!conn.more_streams_allowed());
+        // A second stream would wait in h2's pending-open queue; refuse it instead.
+        assert!(conn.spawn_stream().await.unwrap().is_none());
+
+        drop(first);
+        assert!(conn.spawn_stream().await.unwrap().is_some());
     }
 
     #[cfg(all(feature = "any_tls", unix))]
