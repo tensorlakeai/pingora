@@ -94,6 +94,14 @@ impl ConnectionRef {
             && self.0.connection_stub.0.current_max_send_streams() > current
     }
 
+    /// Whether the local `max_streams` allows another stream. Unlike
+    /// [Self::more_streams_allowed], this ignores the server's limit, which is 1 until the
+    /// server's SETTINGS arrive.
+    fn has_local_capacity(&self) -> bool {
+        !self.is_shutting_down()
+            && self.0.max_streams > self.0.current_streams.load(Ordering::Relaxed)
+    }
+
     pub fn is_idle(&self) -> bool {
         self.0.current_streams.load(Ordering::Relaxed) == 0
     }
@@ -297,7 +305,9 @@ impl Connector {
         let Some(h2_stream) = conn.spawn_stream().await? else {
             return Error::e_explain(H2Error, "new h2 connection has no free stream");
         };
-        if conn.more_streams_allowed() {
+        // The server's SETTINGS have usually not arrived yet, so its limit still reads 1. Pool
+        // the connection by the local limit; `spawn_stream` checks the server's limit on reuse.
+        if conn.has_local_capacity() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }
         Ok(HttpSession::H2(h2_stream))
@@ -325,39 +335,41 @@ impl Connector {
         // which will cause issue where spawn_stream() could return None because others call it
         // first. Thus a caller might have to retry or give up. This issue is more likely to happen
         // when concurrency is high.
-        let maybe_conn = self
-            .in_use_pool
-            .get(reuse_hash)
-            // filter out closed, InUsePool does not have notify closed eviction like the idle pool
-            // and it's possible we get an in use connection that is closed and not yet released
-            .filter(|c| !c.is_closed())
-            .or_else(|| self.idle_pool.get(&reuse_hash));
-        if let Some(conn) = maybe_conn {
-            #[cfg(unix)]
-            if !peer.matches_fd(conn.id()) {
+        // filter out closed, InUsePool does not have notify closed eviction like the idle pool
+        // and it's possible we get an in use connection that is closed and not yet released
+        if let Some(conn) = self.in_use_pool.get(reuse_hash).filter(|c| !c.is_closed()) {
+            if !matches_peer(peer, &conn) {
                 return Ok(None);
             }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::{AsRawSocket, RawSocket};
-                struct WrappedRawSocket(RawSocket);
-                impl AsRawSocket for WrappedRawSocket {
-                    fn as_raw_socket(&self) -> RawSocket {
-                        self.0
-                    }
-                }
-                if !peer.matches_sock(WrappedRawSocket(conn.id() as RawSocket)) {
-                    return Ok(None);
-                }
+            let h2_stream = self.spawn_reused_stream(reuse_hash, conn).await?;
+            if h2_stream.is_some() {
+                return Ok(h2_stream);
             }
-            let h2_stream = conn.spawn_stream().await?;
-            if conn.more_streams_allowed() {
-                self.in_use_pool.insert(reuse_hash, conn);
-            }
-            Ok(h2_stream)
-        } else {
-            Ok(None)
+            // That connection is at the server's limit, which was not known when it was pooled.
+            // It returns to the pool when one of its streams is released. Try an idle one.
         }
+        match self.idle_pool.get(&reuse_hash) {
+            Some(conn) if matches_peer(peer, &conn) => {
+                self.spawn_reused_stream(reuse_hash, conn).await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Spawn a stream on a connection taken from a pool, and put the connection back in the
+    /// in-use pool if it got the stream and its local limit allows more.
+    async fn spawn_reused_stream(
+        &self,
+        reuse_hash: u64,
+        conn: ConnectionRef,
+    ) -> Result<Option<Http2Session>> {
+        let h2_stream = conn.spawn_stream().await?;
+        // Not one that is full: every caller would take it and get no stream. A full
+        // connection returns to the pool when one of its streams is released.
+        if h2_stream.is_some() && conn.has_local_capacity() {
+            self.in_use_pool.insert(reuse_hash, conn);
+        }
+        Ok(h2_stream)
     }
 
     /// Release a finished h2 stream.
@@ -458,7 +470,11 @@ pub async fn handshake(
     // TODO: make these configurable
     let (send_req, connection) = Builder::new()
         .enable_push(false)
-        .initial_max_send_streams(max_streams)
+        // Allow one stream until the server's SETTINGS arrive and h2 replaces this with the
+        // server's limit. Assuming more would send extra streams on this connection before
+        // the limit is known, and h2 queues any over it, with no timeout, until a stream
+        // closes. Requests that come in before then open new connections instead.
+        .initial_max_send_streams(1)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
@@ -471,11 +487,10 @@ pub async fn handshake(
     debug!("H2 handshake to server done.");
     let ping_timeout_occurred = Arc::new(AtomicBool::new(false));
     let ping_timeout_clone = ping_timeout_occurred.clone();
-    let max_allowed_streams = std::cmp::min(max_streams, connection.max_concurrent_send_streams());
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
     // The server won't commonly advertise 0 max stream.
-    if max_allowed_streams == 0 {
+    if connection.max_concurrent_send_streams() == 0 {
         return Error::e_explain(H2Error, "zero max_concurrent_send_streams received");
     }
 
@@ -496,9 +511,30 @@ pub async fn handshake(
         closed_rx,
         ping_timeout_occurred,
         id,
-        max_allowed_streams,
+        // The local cap only: `spawn_stream` also checks the server's current limit, which is
+        // 1 until its SETTINGS arrive.
+        max_streams,
         digest,
     ))
+}
+
+/// Whether a pooled connection is the peer's own, for peers that pin a socket.
+fn matches_peer<P: Peer>(peer: &P, conn: &ConnectionRef) -> bool {
+    #[cfg(unix)]
+    {
+        peer.matches_fd(conn.id())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawSocket, RawSocket};
+        struct WrappedRawSocket(RawSocket);
+        impl AsRawSocket for WrappedRawSocket {
+            fn as_raw_socket(&self) -> RawSocket {
+                self.0
+            }
+        }
+        peer.matches_sock(WrappedRawSocket(conn.id() as RawSocket))
+    }
 }
 
 // TODO(slava): add custom unit tests
@@ -612,6 +648,12 @@ mod tests {
         };
 
         let id = h2_1.conn.id();
+        // Until the server's SETTINGS arrive the connection allows one stream.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !h2_1.conn.more_streams_allowed() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
         let h2_2 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_2.conn.id());
@@ -687,6 +729,39 @@ mod tests {
 
         drop(first);
         assert!(conn.spawn_stream().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_new_connection_allows_one_stream_until_server_settings() {
+        let (client_io, mut server_io) = tokio::io::duplex(65536);
+        let conn = handshake(Box::new(client_io), 4, None).await.unwrap();
+
+        // The server has sent nothing yet, so its limit is unknown.
+        let first = conn
+            .spawn_stream()
+            .await
+            .unwrap()
+            .expect("first stream fits");
+        assert!(!conn.more_streams_allowed());
+        assert!(conn.spawn_stream().await.unwrap().is_none());
+
+        // The server's SETTINGS allow three streams.
+        use tokio::io::AsyncWriteExt;
+        let settings = [0, 0, 6, 0x4, 0, 0, 0, 0, 0, 0, 0x3, 0, 0, 0, 3];
+        server_io.write_all(&settings).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !conn.more_streams_allowed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server SETTINGS were not applied"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let second = conn.spawn_stream().await.unwrap();
+        let third = conn.spawn_stream().await.unwrap();
+        assert!(second.is_some() && third.is_some());
+        assert!(conn.spawn_stream().await.unwrap().is_none());
+        drop((first, second, third, server_io));
     }
 
     #[cfg(all(feature = "any_tls", unix))]
