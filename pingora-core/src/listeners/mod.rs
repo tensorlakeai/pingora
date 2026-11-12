@@ -126,7 +126,8 @@ pub(crate) type SharedTlsAcceptCallbacks = Arc<dyn TlsAccept + Send + Sync>;
 /// Callback for processing raw bytes before TLS handshake.
 ///
 /// This trait allows applications to read and process data from the raw TCP stream
-/// before the TLS handshake occurs. This is useful for protocols like HAProxy's
+/// before the TLS handshake occurs. On a listener without TLS, it runs before the
+/// application reads the stream. This is useful for protocols like HAProxy's
 /// PROXY protocol, which sends client address information before TLS.
 ///
 /// # Example
@@ -315,12 +316,12 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer(self.l4_buffer);
+        // Process data that precedes the application protocol (e.g., a PROXY
+        // protocol header) on TLS and plain TCP listeners alike.
+        if let Some(ref callback) = self.pre_tls_callback {
+            callback.process(&mut self.l4).await?;
+        }
         if let Some(tls) = self.tls {
-            // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
-            if let Some(ref callback) = self.pre_tls_callback {
-                callback.process(&mut self.l4).await?;
-            }
-
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
         } else {
@@ -604,6 +605,47 @@ mod test {
         let mut response = [0; 4];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
+    }
+
+    #[tokio::test]
+    async fn test_pre_tls_callback_runs_on_plain_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct StripPrefix;
+
+        #[async_trait]
+        impl PreTlsProcess for StripPrefix {
+            async fn process(&self, stream: &mut L4Stream) -> Result<()> {
+                let mut prefix = [0; 4];
+                stream.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"HDR:");
+                Ok(())
+            }
+        }
+
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.set_pre_tls_callback(Arc::new(StripPrefix));
+        let listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap().handshake().await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"HDR:ping").await.unwrap();
+        server.await.unwrap();
     }
 
     #[test]
